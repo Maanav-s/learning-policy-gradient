@@ -1,5 +1,3 @@
-from itertools import accumulate
-
 import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
@@ -9,27 +7,53 @@ import gymnasium as gym
 from gymnasium.spaces import Discrete, Box
 
 
-def mlp(obs_dim, n_actions):
-    return nn.Sequential(nn.Linear(obs_dim, 32), nn.Tanh(), 
-                         nn.Linear(32, n_actions), nn.Identity())
+ENV_ID = "LunarLander-v3"
+ENV_KWARGS = dict(
+    continuous=True,
+    gravity=-10.0,
+    enable_wind=False,
+    wind_power=15.0,
+    turbulence_power=1.5,
+)
 
-def train(lr=1e-2, epochs=50, batch_size=5000, render=False):
-    env = gym.make("CartPole-v1")
-    demo_env = gym.make("CartPole-v1", render_mode="human") if render else None
+class Policy(nn.Module):
+    def __init__(self, obs_dims, act_dims):
+        super().__init__()
+        self.base = nn.Sequential(
+            nn.Linear(obs_dims, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+        )
+        self.mean_head = nn.Linear(64, act_dims)
+        self.log_stds = nn.Parameter(torch.zeros(act_dims))
+    
+    def forward(self, obs):
+        base = self.base(obs)
+        m = self.mean_head(base)
+        std = self.log_stds.exp()
+        return torch.distributions.Normal(m, std)
+
+    def act(self, obs):
+        dist = self.forward(obs)
+        u = dist.rsample()
+        log_prob = dist.log_prob(u).sum(-1)
+
+        action = torch.tanh(u)
+        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1) # Apparently this adds numerical stability
+
+        return action, log_prob
+
+
+def train(lr=1e-3, epochs=100, batch_size=90000, gamma=0.985, render=False):
+    env = gym.make(ENV_ID, **ENV_KWARGS)
+    demo_env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS) if render else None
 
     obs_dim = env.observation_space.shape[0]
-    n_actions = env.action_space.n
+    n_actions = env.action_space.shape[0]
 
-    model = mlp(obs_dim, n_actions)
+    model = Policy(obs_dim, n_actions)
     
-    def get_policy(obs):
-        return Categorical(logits=model(obs))
-    
-    def get_action(obs):
-        return get_policy(obs).sample().item()
-    
-    def compute_loss(obs, act, weights):
-        return -(get_policy(obs).log_prob(act)*weights).mean()
+    def compute_loss(log_prob, weights):
+        return -(log_prob*weights).mean()
 
     optimizer = Adam(model.parameters(), lr=lr)
 
@@ -37,16 +61,21 @@ def train(lr=1e-2, epochs=50, batch_size=5000, render=False):
         obs, _ = demo_env.reset()
         done = False
         while not done:
-            act = get_action(torch.as_tensor(obs, dtype=torch.float32))
-            obs, _, terminated, truncated, _ = demo_env.step(act)
+            act, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            obs, _, terminated, truncated, _ = demo_env.step(act.detach().numpy())
             done = terminated or truncated
     
     def reward_to_go(rews):
-        return list(accumulate(reversed(rews)))[::-1]
+        out, running = [], 0.0
+        for r in reversed(rews):
+            running = r + gamma * running
+            out.append(running)
+        return out[::-1]
 
     def epoch():
         batch_obs = []
         batch_acts = []
+        batch_log_probs = []
         batch_weights = []
         batch_rets = []
         batch_lens = []
@@ -61,11 +90,13 @@ def train(lr=1e-2, epochs=50, batch_size=5000, render=False):
             batch_obs.append(obs.copy())
 
             # act in the environment
-            act = get_action(torch.as_tensor(obs, dtype=torch.float32))
-            obs, rew, done, _, _ = env.step(act)
+            act, log_probs = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            obs, rew, terminated, truncated, _ = env.step(act.detach().numpy())
+            done = terminated or truncated
 
             # save action, reward
             batch_acts.append(act)
+            batch_log_probs.append(log_probs)
             ep_rews.append(rew)
 
             if done:
@@ -88,20 +119,19 @@ def train(lr=1e-2, epochs=50, batch_size=5000, render=False):
 
         # take a single policy gradient update step
         optimizer.zero_grad()
-        batch_loss = compute_loss(obs=torch.as_tensor(batch_obs, dtype=torch.float32),
-                                  act=torch.as_tensor(batch_acts, dtype=torch.int32),
-                                  weights=torch.as_tensor(batch_weights, dtype=torch.float32)
-                                  )
+        weights = torch.as_tensor(batch_weights, dtype=torch.float32)
+        weights = (weights - weights.mean()) / (weights.std())
+        batch_loss = compute_loss(torch.stack(batch_log_probs), weights)
         batch_loss.backward()
         optimizer.step()
-        return batch_loss, batch_rets, batch_lens
+        return batch_loss.item(), batch_rets, batch_lens
     
     for i in range(epochs):
         if render:
             run_demo_episode()
         batch_loss, batch_rets, batch_lens = epoch()
-        print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f'%
-                (i, batch_loss, np.mean(batch_rets), np.mean(batch_lens)))
+        print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f' %
+              (i, batch_loss, np.mean(batch_rets), np.mean(batch_lens)))
 
 if __name__ == '__main__':
     train(render=True)
