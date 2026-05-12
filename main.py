@@ -1,12 +1,18 @@
+import argparse
+import os
+
 import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.optim import Adam
 import numpy as np
+import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium.spaces import Discrete, Box
 
 
+CHECKPOINT_DIR = "checkpoints"
+FIGURES_DIR = "figures"
 ENV_ID = "LunarLander-v3"
 ENV_KWARGS = dict(
     continuous=True,
@@ -43,7 +49,9 @@ class Policy(nn.Module):
         return action, log_prob
 
 
-def train(lr=1e-3, epochs=100, batch_size=90000, gamma=0.985, render=False):
+def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
     env = gym.make(ENV_ID, **ENV_KWARGS)
     demo_env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS) if render else None
 
@@ -126,12 +134,79 @@ def train(lr=1e-3, epochs=100, batch_size=90000, gamma=0.985, render=False):
         optimizer.step()
         return batch_loss.item(), batch_rets, batch_lens
     
+    losses, mean_returns, mean_ep_lens = [], [], []
     for i in range(epochs):
         if render:
             run_demo_episode()
         batch_loss, batch_rets, batch_lens = epoch()
+        losses.append(batch_loss)
+        mean_returns.append(float(np.mean(batch_rets)))
+        mean_ep_lens.append(float(np.mean(batch_lens)))
         print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f' %
-              (i, batch_loss, np.mean(batch_rets), np.mean(batch_lens)))
+              (i, batch_loss, mean_returns[-1], mean_ep_lens[-1]))
+
+    ckpt_path = os.path.join(CHECKPOINT_DIR, "policy.pt")
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"saved checkpoint to {ckpt_path}")
+
+    save_training_figures(losses, mean_returns, mean_ep_lens)
+
+
+def save_training_figures(losses, mean_returns, mean_ep_lens):
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    epochs_axis = range(1, len(losses) + 1)
+
+    for name, values, ylabel in [
+        ("loss", losses, "policy loss"),
+        ("return", mean_returns, "mean episode return"),
+        ("episode_length", mean_ep_lens, "mean episode length"),
+    ]:
+        fig, ax = plt.subplots()
+        ax.plot(epochs_axis, values)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{ylabel} per epoch")
+        ax.grid(True, alpha=0.3)
+        out_path = os.path.join(FIGURES_DIR, f"{name}.png")
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"saved figure to {out_path}")
+
+
+def demo(checkpoint_path, n_episodes=5):
+    env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    model = Policy(obs_dim, act_dim)
+    model.load_state_dict(torch.load(checkpoint_path))
+
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        total = 0.0
+        while not done:
+            with torch.no_grad():
+                act, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            obs, rew, terminated, truncated, _ = env.step(act.numpy())
+            total += rew
+            done = terminated or truncated
+        print(f"episode {ep+1}: return = {total:.2f}")
+
+    env.close()
+
 
 if __name__ == '__main__':
-    train(render=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["train", "demo"])
+    parser.add_argument("--checkpoint", type=str, help="path to checkpoint (required for demo)")
+    parser.add_argument("--episodes", type=int, default=5, help="number of demo episodes")
+    parser.add_argument("--render", action="store_true", help="render an episode each epoch during training")
+    args = parser.parse_args()
+
+    if args.mode == "train":
+        train(render=args.render)
+    else:
+        if args.checkpoint is None:
+            parser.error("--checkpoint is required for demo mode")
+        demo(args.checkpoint, n_episodes=args.episodes)
