@@ -46,10 +46,11 @@ class Policy(nn.Module):
         action = torch.tanh(u)
         log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1) # Apparently this adds numerical stability
 
-        return action, log_prob
+        entropy = dist.entropy().sum(-1)
+        return action, log_prob, entropy
 
 
-def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
+def train(lr=1e-3, epochs=35, batch_size=90000, gamma=0.985, entropy_coef=0.01, render=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     env = gym.make(ENV_ID, **ENV_KWARGS)
@@ -60,8 +61,8 @@ def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
 
     model = Policy(obs_dim, n_actions)
     
-    def compute_loss(log_prob, weights):
-        return -(log_prob*weights).mean()
+    def compute_loss(log_prob, weights, entropy):
+        return -(log_prob*weights).mean() - entropy_coef * entropy.mean()
 
     optimizer = Adam(model.parameters(), lr=lr)
 
@@ -69,7 +70,7 @@ def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
         obs, _ = demo_env.reset()
         done = False
         while not done:
-            act, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
             obs, _, terminated, truncated, _ = demo_env.step(act.detach().numpy())
             done = terminated or truncated
     
@@ -84,6 +85,7 @@ def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
         batch_obs = []
         batch_acts = []
         batch_log_probs = []
+        batch_entropies = []
         batch_weights = []
         batch_rets = []
         batch_lens = []
@@ -98,13 +100,14 @@ def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
             batch_obs.append(obs.copy())
 
             # act in the environment
-            act, log_probs = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            act, log_probs, entropy = model.act(torch.as_tensor(obs, dtype=torch.float32))
             obs, rew, terminated, truncated, _ = env.step(act.detach().numpy())
             done = terminated or truncated
 
             # save action, reward
             batch_acts.append(act)
             batch_log_probs.append(log_probs)
+            batch_entropies.append(entropy)
             ep_rews.append(rew)
 
             if done:
@@ -129,7 +132,7 @@ def train(lr=1e-3, epochs=25, batch_size=90000, gamma=0.985, render=False):
         optimizer.zero_grad()
         weights = torch.as_tensor(batch_weights, dtype=torch.float32)
         weights = (weights - weights.mean()) / (weights.std())
-        batch_loss = compute_loss(torch.stack(batch_log_probs), weights)
+        batch_loss = compute_loss(torch.stack(batch_log_probs), weights, torch.stack(batch_entropies))
         batch_loss.backward()
         optimizer.step()
         return batch_loss.item(), batch_rets, batch_lens
@@ -187,7 +190,7 @@ def demo(checkpoint_path, n_episodes=5):
         total = 0.0
         while not done:
             with torch.no_grad():
-                act, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+                act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
             obs, rew, terminated, truncated, _ = env.step(act.numpy())
             total += rew
             done = terminated or truncated
@@ -200,7 +203,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["train", "demo"])
     parser.add_argument("--checkpoint", type=str, help="path to checkpoint (required for demo)")
-    parser.add_argument("--episodes", type=int, default=5, help="number of demo episodes")
+    parser.add_argument("--episodes", type=int, default=10, help="number of demo episodes")
     parser.add_argument("--render", action="store_true", help="render an episode each epoch during training")
     args = parser.parse_args()
 
