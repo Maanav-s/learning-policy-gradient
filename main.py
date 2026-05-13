@@ -16,7 +16,7 @@ FIGURES_DIR = "figures"
 ENV_ID = "LunarLander-v3"
 ENV_KWARGS = dict(
     continuous=True,
-    gravity=-10.0,
+    gravity=-8.0,
     enable_wind=False,
     wind_power=15.0,
     turbulence_power=1.5,
@@ -50,7 +50,7 @@ class Policy(nn.Module):
         return action, log_prob, entropy
 
 
-def train(lr=1e-3, epochs=35, batch_size=90000, gamma=0.985, entropy_coef=0.01, render=False):
+def train(lr=1e-3, epochs=45, batch_size=90000, gamma=0.985, entropy_coef=0.001, render=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     env = gym.make(ENV_ID, **ENV_KWARGS)
