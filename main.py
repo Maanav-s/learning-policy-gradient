@@ -3,6 +3,7 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 import numpy as np
 import matplotlib.pyplot as plt
@@ -37,16 +38,16 @@ class Policy(nn.Module):
 
     def act(self, obs):
         dist = self.forward(obs)
-        u = dist.rsample()
-        log_prob = dist.log_prob(u).sum(-1)
-        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1)
-        action = torch.tanh(u)
-        return action, u, log_prob
+        unsquashed = dist.rsample()
+        log_prob = dist.log_prob(unsquashed).sum(-1)
+        log_prob -= (2 * (np.log(2) - unsquashed - nn.functional.softplus(-2 * unsquashed))).sum(-1)
+        action = torch.tanh(unsquashed)
+        return action, unsquashed, log_prob
 
-    def evaluate(self, obs, u):
+    def evaluate(self, obs, unsquashed):
         dist = self.forward(obs)
-        log_prob = dist.log_prob(u).sum(-1)
-        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1)
+        log_prob = dist.log_prob(unsquashed).sum(-1)
+        log_prob -= (2 * (np.log(2) - unsquashed - nn.functional.softplus(-2 * unsquashed))).sum(-1)
         entropy = dist.entropy().sum(-1)
         return log_prob, entropy
 
@@ -88,7 +89,18 @@ def demo(checkpoint, episodes=10):
 
     env.close()
 
-def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, entropy_coef=0.001, render=False, lam=0.95):
+def train(lr=3e-3, 
+          epochs=25000, 
+          minibatch=125,
+          K=4, 
+          N=25, 
+          T=25, 
+          gamma=0.985,
+          entropy_coef=0.001, 
+          render=False, 
+          lam=0.95, 
+          epsilon=0.2):
+    
     envs = gym.make_vec(ENV_ID,
                            num_envs = N,
                            vectorization_mode="sync",
@@ -124,7 +136,8 @@ def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, en
 
     batch_size = T * N
     obs_buf  = np.zeros((T, N, obs_dim), dtype=np.float32)
-    u_buf    = np.zeros((T, N, n_actions), dtype=np.float32)
+    unsquashed_buf = np.zeros((T, N, n_actions), dtype=np.float32)
+    logp_buf = np.zeros((T, N), dtype=np.float32)
     rew_buf  = np.zeros((T, N), dtype=np.float32)
     done_buf = np.zeros((T, N), dtype=np.float32)
     indices  = np.arange(batch_size)
@@ -140,8 +153,9 @@ def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, en
         with torch.no_grad():
             for t in range(T):
                 obs_buf[t] = obs
-                act, u, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
-                u_buf[t] = u.numpy()
+                act, unsquashed, logprob = model.act(torch.as_tensor(obs, dtype=torch.float32))
+                unsquashed_buf[t] = unsquashed.numpy()
+                logp_buf[t] = logprob.numpy()
                 obs, rew, term, trunc, _ = envs.step(act.numpy())
                 rew_buf[t]  = rew
                 done = term | trunc
@@ -162,10 +176,11 @@ def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, en
             advantage_np = gae(rew_buf, done_buf, values_for_gae, gamma, lam)
             returns_np   = advantage_np + values_old
 
-        flat_u   = torch.as_tensor(u_buf.reshape(batch_size, n_actions), dtype=torch.float32)
+        flat_unsquashed = torch.as_tensor(unsquashed_buf.reshape(batch_size, n_actions), dtype=torch.float32)
         flat_adv = torch.as_tensor(advantage_np.reshape(batch_size), dtype=torch.float32)
         flat_ret = torch.as_tensor(returns_np.reshape(batch_size), dtype=torch.float32)
         flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+        flat_logp = torch.as_tensor(logp_buf.reshape(batch_size), dtype=torch.float32)
 
         a_losses, c_losses = [], []
         for _ in range(K):
@@ -173,15 +188,20 @@ def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, en
             for start in range(0, batch_size, minibatch):
                 mb = indices[start:start + minibatch]
                 mb_obs = flat_obs[mb]
-                mb_u   = flat_u[mb]
+                mb_unsquashed = flat_unsquashed[mb]
                 mb_adv = flat_adv[mb]
                 mb_ret = flat_ret[mb]
+                mb_logp_old = flat_logp[mb]
 
-                new_logp, entropy = model.evaluate(mb_obs, mb_u)
+                new_logp, entropy = model.evaluate(mb_obs, mb_unsquashed)
                 new_values = critic(mb_obs)
 
-                actor_loss  = -(new_logp * mb_adv).mean() - entropy_coef * entropy.mean()
-                critic_loss = ((mb_ret - new_values) ** 2).mean()
+                ratio = (new_logp - mb_logp_old).exp()
+                unclamped_obj = ratio * mb_adv
+                clamped_obj = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * mb_adv
+                actor_loss = -torch.min(unclamped_obj, clamped_obj).mean()
+                actor_loss -= entropy_coef * entropy.mean()
+                critic_loss = F.mse_loss(new_values, mb_ret)
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
