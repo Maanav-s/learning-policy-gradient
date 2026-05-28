@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium.spaces import Discrete, Box
 
-
 CHECKPOINT_DIR = "checkpoints"
 FIGURES_DIR = "figures"
 ENV_ID = "LunarLander-v3"
@@ -49,22 +48,45 @@ class Policy(nn.Module):
         entropy = dist.entropy().sum(-1)
         return action, log_prob, entropy
 
+class Critic(nn.Module):
+    def __init__(self, obs_dims):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dims, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, 1),
+        )
+    
+    def forward(self, obs):
+        return self.net(obs).squeeze(-1)
 
-def train(lr=1e-3, epochs=45, batch_size=90000, gamma=0.985, entropy_coef=0.001, render=False):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+def reward_to_go(rews, dones, gamma):
+    # rews, dones: (T, num_envs). dones[t, i] = True iff env i terminated at step t.
+    # Returns discounted reward-to-go with the same shape, reset at episode boundaries.
+    rews = np.asarray(rews, dtype=np.float32)
+    dones = np.asarray(dones, dtype=np.float32)
+    out = np.empty_like(rews)
+    running = np.zeros(rews.shape[1:], dtype=np.float32)
+    for t in range(rews.shape[0] - 1, -1, -1):
+        running = rews[t] + gamma * running * (1.0 - dones[t])
+        out[t] = running
+    return out
 
-    env = gym.make(ENV_ID, **ENV_KWARGS)
+
+def train(lr=1e-3, batches=100000, batch_step=10, gamma=0.985, entropy_coef=0.001, render=False):
+    envs = gym.make_vec(ENV_ID,
+                           num_envs = 15,
+                           vectorization_mode="async",
+                           **ENV_KWARGS)
     demo_env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS) if render else None
 
-    obs_dim = env.observation_space.shape[0]
-    n_actions = env.action_space.shape[0]
+    obs_dim = envs.single_observation_space.shape[0]
+    n_actions = envs.single_action_space.shape[0]
 
     model = Policy(obs_dim, n_actions)
-    
-    def compute_loss(log_prob, weights, entropy):
-        return -(log_prob*weights).mean() - entropy_coef * entropy.mean()
-
-    optimizer = Adam(model.parameters(), lr=lr)
+    critic = Critic(obs_dim)
+    actor_optimizer = Adam(model.parameters(), lr=lr)
+    critic_optimizer = Adam(critic.parameters(), lr=lr)
 
     def run_demo_episode():
         obs, _ = demo_env.reset()
@@ -73,102 +95,119 @@ def train(lr=1e-3, epochs=45, batch_size=90000, gamma=0.985, entropy_coef=0.001,
             act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
             obs, _, terminated, truncated, _ = demo_env.step(act.detach().numpy())
             done = terminated or truncated
-    
-    def reward_to_go(rews):
-        out, running = [], 0.0
-        for r in reversed(rews):
-            running = r + gamma * running
-            out.append(running)
-        return out[::-1]
 
-    def epoch():
-        batch_obs = []
-        batch_acts = []
-        batch_log_probs = []
-        batch_entropies = []
-        batch_weights = []
-        batch_rets = []
-        batch_lens = []
+    T, N = batch_step, envs.num_envs
+    obs_buf  = np.zeros((T, N, obs_dim), dtype=np.float32)
+    rew_buf  = np.zeros((T, N), dtype=np.float32)
+    done_buf = np.zeros((T, N), dtype=np.float32)
+    logp_buf = [None] * T
+    ent_buf  = [None] * T
 
-        obs, _ = env.reset()
-        done = False
-        ep_rews = []
+    ep_returns_log = []
+    ep_lengths_log = []
+    ep_ret_running = np.zeros(N, dtype=np.float32)
+    ep_len_running = np.zeros(N, dtype=np.int64)
 
-        while True:
+    obs, _ = envs.reset()
 
-            # save obs
-            batch_obs.append(obs.copy())
+    def run_batch(obs):
+        nonlocal ep_ret_running, ep_len_running
+        for t in range(T):
+            obs_buf[t] = obs
+            act, log_prob, entropy = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            logp_buf[t] = log_prob
+            ent_buf[t]  = entropy
+            obs, rew, term, trunc, _ = envs.step(act.detach().numpy())
+            rew_buf[t]  = rew
+            done = term | trunc
+            done_buf[t] = done
 
-            # act in the environment
-            act, log_probs, entropy = model.act(torch.as_tensor(obs, dtype=torch.float32))
-            obs, rew, terminated, truncated, _ = env.step(act.detach().numpy())
-            done = terminated or truncated
+            ep_ret_running += rew
+            ep_len_running += 1
+            for i in np.where(done)[0]:
+                ep_returns_log.append(float(ep_ret_running[i]))
+                ep_lengths_log.append(int(ep_len_running[i]))
+            ep_ret_running[done] = 0.0
+            ep_len_running[done] = 0
 
-            # save action, reward
-            batch_acts.append(act)
-            batch_log_probs.append(log_probs)
-            batch_entropies.append(entropy)
-            ep_rews.append(rew)
+        rtg = reward_to_go(rew_buf, done_buf, gamma)               # (T, N)
+        returns = torch.as_tensor(rtg.reshape(-1), dtype=torch.float32)  # (T*N,)
 
-            if done:
-                # if episode is over, record info about episode
-                ep_ret, ep_len = sum(ep_rews), len(ep_rews)
-                batch_rets.append(ep_ret)
-                batch_lens.append(ep_len)
+        flat_obs = torch.as_tensor(obs_buf.reshape(T * N, obs_dim), dtype=torch.float32)
+        values = critic(flat_obs)                                  # (T*N,) with grad
 
-                # the weight for each logprob(a|s) is R(tau)
-                batch_weights += list(reward_to_go(ep_rews))
+        advantage = (returns - values).detach()
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-                # reset episode-specific variables
-                obs, _ = env.reset()
-                done = False
-                ep_rews = []
+        log_probs = torch.stack(logp_buf).reshape(-1)              # (T*N,)
+        entropies = torch.stack(ent_buf).reshape(-1)               # (T*N,)
 
-                # end experience loop if we have enough of it
-                if len(batch_obs) > batch_size:
-                    break
+        actor_loss = -(log_probs * advantage).mean() - entropy_coef * entropies.mean()
+        critic_loss = ((returns - values) ** 2).mean()
 
-        # take a single policy gradient update step
-        optimizer.zero_grad()
-        weights = torch.as_tensor(batch_weights, dtype=torch.float32)
-        weights = (weights - weights.mean()) / (weights.std())
-        batch_loss = compute_loss(torch.stack(batch_log_probs), weights, torch.stack(batch_entropies))
-        batch_loss.backward()
-        optimizer.step()
-        return batch_loss.item(), batch_rets, batch_lens
-    
-    losses, mean_returns, mean_ep_lens = [], [], []
-    for i in range(epochs):
-        if render:
-            run_demo_episode()
-        batch_loss, batch_rets, batch_lens = epoch()
-        losses.append(batch_loss)
-        mean_returns.append(float(np.mean(batch_rets)))
-        mean_ep_lens.append(float(np.mean(batch_lens)))
-        print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f' %
-              (i, batch_loss, mean_returns[-1], mean_ep_lens[-1]))
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
 
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
+
+        return obs, actor_loss.item(), critic_loss.item(), rew_buf.sum(0).mean()
+
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     ckpt_path = os.path.join(CHECKPOINT_DIR, "policy.pt")
+
+    actor_losses, critic_losses = [], []
+    for b in range(batches):
+        obs, a_loss, c_loss, mean_rew = run_batch(obs)
+        actor_losses.append(a_loss)
+        critic_losses.append(c_loss)
+        if b % 1000 == 0:
+            recent_ret = float(np.mean(ep_returns_log[-50:])) if ep_returns_log else float("nan")
+            print(f"batch {b:6d} | actor {a_loss:+.3f} | critic {c_loss:.3f} | window rew {mean_rew:+.3f} | recent ep return {recent_ret:+.3f}")
+            if b > 0:
+                torch.save(model.state_dict(), ckpt_path)
+                print(f"  [periodic] saved checkpoint at batch {b} -> {ckpt_path}")
+                if render:
+                    run_demo_episode()
+
     torch.save(model.state_dict(), ckpt_path)
     print(f"saved checkpoint to {ckpt_path}")
 
-    save_training_figures(losses, mean_returns, mean_ep_lens)
+    save_training_figures(actor_losses, critic_losses, ep_returns_log, ep_lengths_log)
 
 
-def save_training_figures(losses, mean_returns, mean_ep_lens):
+def save_training_figures(actor_losses, critic_losses, ep_returns, ep_lengths):
     os.makedirs(FIGURES_DIR, exist_ok=True)
-    epochs_axis = range(1, len(losses) + 1)
 
-    for name, values, ylabel in [
-        ("loss", losses, "policy loss"),
-        ("return", mean_returns, "mean episode return"),
-        ("episode_length", mean_ep_lens, "mean episode length"),
-    ]:
+    def smooth(values, window):
+        if len(values) < window or window < 2:
+            return np.asarray(values, dtype=np.float32)
+        cs = np.cumsum(np.insert(np.asarray(values, dtype=np.float32), 0, 0.0))
+        return (cs[window:] - cs[:-window]) / window
+
+    panels = [
+        ("actor_loss",     actor_losses,  "actor loss",     "batch"),
+        ("critic_loss",    critic_losses, "critic loss",    "batch"),
+        ("return",         ep_returns,    "episode return", "completed episode"),
+        ("episode_length", ep_lengths,    "episode length", "completed episode"),
+    ]
+    for name, values, ylabel, xlabel in panels:
+        if len(values) == 0:
+            print(f"skipping {name}: no data")
+            continue
+        window = max(1, min(200, len(values) // 20))
+        smoothed = smooth(values, window)
         fig, ax = plt.subplots()
-        ax.plot(epochs_axis, values)
-        ax.set_xlabel("epoch")
+        ax.plot(values, alpha=0.25, label="raw")
+        if len(smoothed) > 0 and window > 1:
+            offset = len(values) - len(smoothed)
+            ax.plot(range(offset, len(values)), smoothed, label=f"smoothed (w={window})")
+            ax.legend()
+        ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
-        ax.set_title(f"{ylabel} per epoch")
+        ax.set_title(f"{ylabel}")
         ax.grid(True, alpha=0.3)
         out_path = os.path.join(FIGURES_DIR, f"{name}.png")
         fig.savefig(out_path, dpi=120, bbox_inches="tight")
@@ -176,40 +215,8 @@ def save_training_figures(losses, mean_returns, mean_ep_lens):
         print(f"saved figure to {out_path}")
 
 
-def demo(checkpoint_path, n_episodes=5):
-    env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    model = Policy(obs_dim, act_dim)
-    model.load_state_dict(torch.load(checkpoint_path))
-
-    for ep in range(n_episodes):
-        obs, _ = env.reset()
-        done = False
-        total = 0.0
-        while not done:
-            with torch.no_grad():
-                act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
-            obs, rew, terminated, truncated, _ = env.step(act.numpy())
-            total += rew
-            done = terminated or truncated
-        print(f"episode {ep+1}: return = {total:.2f}")
-
-    env.close()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["train", "demo"])
-    parser.add_argument("--checkpoint", type=str, help="path to checkpoint (required for demo)")
-    parser.add_argument("--episodes", type=int, default=10, help="number of demo episodes")
-    parser.add_argument("--render", action="store_true", help="render an episode each epoch during training")
+    parser.add_argument("--render", action="store_true", help="show a live demo episode every 1000 batches")
     args = parser.parse_args()
-
-    if args.mode == "train":
-        train(render=args.render)
-    else:
-        if args.checkpoint is None:
-            parser.error("--checkpoint is required for demo mode")
-        demo(args.checkpoint, n_episodes=args.episodes)
+    train(render=args.render)
