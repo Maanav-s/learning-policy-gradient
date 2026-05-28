@@ -3,12 +3,10 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 from torch.optim import Adam
 import numpy as np
 import matplotlib.pyplot as plt
 import gymnasium as gym
-from gymnasium.spaces import Discrete, Box
 
 CHECKPOINT_DIR = "checkpoints"
 FIGURES_DIR = "figures"
@@ -41,12 +39,16 @@ class Policy(nn.Module):
         dist = self.forward(obs)
         u = dist.rsample()
         log_prob = dist.log_prob(u).sum(-1)
-
+        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1)
         action = torch.tanh(u)
-        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1) # Apparently this adds numerical stability
+        return action, u, log_prob
 
+    def evaluate(self, obs, u):
+        dist = self.forward(obs)
+        log_prob = dist.log_prob(u).sum(-1)
+        log_prob -= (2 * (np.log(2) - u - nn.functional.softplus(-2 * u))).sum(-1)
         entropy = dist.entropy().sum(-1)
-        return action, log_prob, entropy
+        return log_prob, entropy
 
 class Critic(nn.Module):
     def __init__(self, obs_dims):
@@ -60,9 +62,35 @@ class Critic(nn.Module):
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
 
-def train(lr=3e-3, batches=100000, batch_step=25, gamma=0.985, entropy_coef=0.001, render=False, lam=0.95):
+def demo(checkpoint, episodes=10):
+    env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS)
+    obs_dim = env.observation_space.shape[0]
+    n_actions = env.action_space.shape[0]
+
+    model = Policy(obs_dim, n_actions)
+    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    model.eval()
+
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_return = 0.0
+        ep_length = 0
+        while not done:
+            with torch.no_grad():
+                dist = model(torch.as_tensor(obs, dtype=torch.float32))
+                act = torch.tanh(dist.sample((5,))).mean(dim=0)
+            obs, rew, terminated, truncated, _ = env.step(act.numpy())
+            ep_return += float(rew)
+            ep_length += 1
+            done = terminated or truncated
+        print(f"episode {ep+1:2d} | return {ep_return:+.2f} | length {ep_length}")
+
+    env.close()
+
+def train(lr=3e-3, epochs=25000, minibatch=125, K=4, N=25, T=25, gamma=0.985, entropy_coef=0.001, render=False, lam=0.95):
     envs = gym.make_vec(ENV_ID,
-                           num_envs = 25,
+                           num_envs = N,
                            vectorization_mode="sync",
                            **ENV_KWARGS)
     demo_env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS) if render else None
@@ -75,15 +103,13 @@ def train(lr=3e-3, batches=100000, batch_step=25, gamma=0.985, entropy_coef=0.00
     actor_optimizer = Adam(model.parameters(), lr=lr)
     critic_optimizer = Adam(critic.parameters(), lr=lr)
 
-    def gae(rews, dones, values, gamma, l): #l is lambda
-        rews = np.asarray(rews, dtype=np.float32)
-        dones = np.asarray(dones, dtype=np.float32)
+    def gae(rews, dones, values, gamma, l):
         advantages = np.empty_like(rews)
         running = np.zeros(rews.shape[1:], dtype=np.float32)
         for t in range(rews.shape[0] - 1, -1, -1):
             nonterminal = (1.0 - dones[t])
-            deltas = rews[t] - values[t] + gamma * values[t+1] * nonterminal
-            running = deltas + gamma * l * running * nonterminal
+            delta = rews[t] - values[t] + gamma * values[t+1] * nonterminal
+            running = delta + gamma * l * running * nonterminal
             advantages[t] = running
         return advantages
 
@@ -91,16 +117,17 @@ def train(lr=3e-3, batches=100000, batch_step=25, gamma=0.985, entropy_coef=0.00
         obs, _ = demo_env.reset()
         done = False
         while not done:
-            act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
-            obs, _, terminated, truncated, _ = demo_env.step(act.detach().numpy())
+            with torch.no_grad():
+                act, _, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+            obs, _, terminated, truncated, _ = demo_env.step(act.numpy())
             done = terminated or truncated
 
-    T, N = batch_step, envs.num_envs
+    batch_size = T * N
     obs_buf  = np.zeros((T, N, obs_dim), dtype=np.float32)
+    u_buf    = np.zeros((T, N, n_actions), dtype=np.float32)
     rew_buf  = np.zeros((T, N), dtype=np.float32)
     done_buf = np.zeros((T, N), dtype=np.float32)
-    logp_buf = [None] * T
-    ent_buf  = [None] * T
+    indices  = np.arange(batch_size)
 
     ep_returns_log = []
     ep_lengths_log = []
@@ -109,72 +136,79 @@ def train(lr=3e-3, batches=100000, batch_step=25, gamma=0.985, entropy_coef=0.00
 
     obs, _ = envs.reset()
 
-    def run_batch(obs):
-        nonlocal ep_ret_running, ep_len_running
-        for t in range(T):
-            obs_buf[t] = obs
-            act, log_prob, entropy = model.act(torch.as_tensor(obs, dtype=torch.float32))
-            logp_buf[t] = log_prob
-            ent_buf[t]  = entropy
-            obs, rew, term, trunc, _ = envs.step(act.detach().numpy())
-            rew_buf[t]  = rew
-            done = term | trunc
-            done_buf[t] = done
+    def run_epoch(obs):
+        with torch.no_grad():
+            for t in range(T):
+                obs_buf[t] = obs
+                act, u, _ = model.act(torch.as_tensor(obs, dtype=torch.float32))
+                u_buf[t] = u.numpy()
+                obs, rew, term, trunc, _ = envs.step(act.numpy())
+                rew_buf[t]  = rew
+                done = term | trunc
+                done_buf[t] = done
 
-            ep_ret_running += rew
-            ep_len_running += 1
-            for i in np.where(done)[0]:
-                ep_returns_log.append(float(ep_ret_running[i]))
-                ep_lengths_log.append(int(ep_len_running[i]))
-            ep_ret_running[done] = 0.0
-            ep_len_running[done] = 0
+                np.add(ep_ret_running, rew, out=ep_ret_running)
+                np.add(ep_len_running, 1, out=ep_len_running)
+                for i in np.where(done)[0]:
+                    ep_returns_log.append(float(ep_ret_running[i]))
+                    ep_lengths_log.append(int(ep_len_running[i]))
+                ep_ret_running[done] = 0.0
+                ep_len_running[done] = 0
 
-        flat_obs = torch.as_tensor(obs_buf.reshape(T * N, obs_dim), dtype=torch.float32)
-        values = critic(flat_obs)                                  # (T*N,) with grad
+            flat_obs    = torch.as_tensor(obs_buf.reshape(batch_size, obs_dim), dtype=torch.float32)
+            values_old  = critic(flat_obs).numpy().reshape(T, N)
+            last_values = critic(torch.as_tensor(obs, dtype=torch.float32)).numpy()
+            values_for_gae = np.concatenate([values_old, last_values[None, :]], axis=0)
+            advantage_np = gae(rew_buf, done_buf, values_for_gae, gamma, lam)
+            returns_np   = advantage_np + values_old
 
-        # bootstrap V(s_T) on the obs returned after the last step, then build (T+1, N) for GAE
-        last_values = critic(torch.as_tensor(obs, dtype=torch.float32))       # (N,)
-        values_for_gae = np.concatenate([
-            values.detach().numpy().reshape(T, N),
-            last_values.detach().numpy()[None, :],
-        ], axis=0)                                                 # (T+1, N)
+        flat_u   = torch.as_tensor(u_buf.reshape(batch_size, n_actions), dtype=torch.float32)
+        flat_adv = torch.as_tensor(advantage_np.reshape(batch_size), dtype=torch.float32)
+        flat_ret = torch.as_tensor(returns_np.reshape(batch_size), dtype=torch.float32)
+        flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
 
-        advantage_np = gae(rew_buf, done_buf, values_for_gae, gamma, lam)     # (T, N)
-        advantage_raw = torch.as_tensor(advantage_np.reshape(-1), dtype=torch.float32)
-        returns = advantage_raw + values.detach()                  # TD(λ) returns as critic target
+        a_losses, c_losses = [], []
+        for _ in range(K):
+            np.random.shuffle(indices)
+            for start in range(0, batch_size, minibatch):
+                mb = indices[start:start + minibatch]
+                mb_obs = flat_obs[mb]
+                mb_u   = flat_u[mb]
+                mb_adv = flat_adv[mb]
+                mb_ret = flat_ret[mb]
 
-        advantage = (advantage_raw - advantage_raw.mean()) / (advantage_raw.std() + 1e-8)
+                new_logp, entropy = model.evaluate(mb_obs, mb_u)
+                new_values = critic(mb_obs)
 
-        log_probs = torch.stack(logp_buf).reshape(-1)              # (T*N,)
-        entropies = torch.stack(ent_buf).reshape(-1)               # (T*N,)
+                actor_loss  = -(new_logp * mb_adv).mean() - entropy_coef * entropy.mean()
+                critic_loss = ((mb_ret - new_values) ** 2).mean()
 
-        actor_loss = -(log_probs * advantage).mean() - entropy_coef * entropies.mean()
-        critic_loss = ((returns - values) ** 2).mean()
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
 
-        actor_optimizer.zero_grad()
-        actor_loss.backward()
-        actor_optimizer.step()
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                critic_optimizer.step()
 
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        critic_optimizer.step()
+                a_losses.append(actor_loss.item())
+                c_losses.append(critic_loss.item())
 
-        return obs, actor_loss.item(), critic_loss.item(), rew_buf.sum(0).mean()
+        return obs, float(np.mean(a_losses)), float(np.mean(c_losses)), rew_buf.sum(0).mean()
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     ckpt_path = os.path.join(CHECKPOINT_DIR, "policy.pt")
 
     actor_losses, critic_losses = [], []
-    for b in range(batches):
-        obs, a_loss, c_loss, mean_rew = run_batch(obs)
+    for e in range(epochs):
+        obs, a_loss, c_loss, mean_rew = run_epoch(obs)
         actor_losses.append(a_loss)
         critic_losses.append(c_loss)
-        if b % 1000 == 0:
+        if e % 1000 == 0:
             recent_ret = float(np.mean(ep_returns_log[-50:])) if ep_returns_log else float("nan")
-            print(f"batch {b:6d} | actor {a_loss:+.3f} | critic {c_loss:.3f} | window rew {mean_rew:+.3f} | recent ep return {recent_ret:+.3f}")
-            if b > 0:
+            print(f"epoch {e:6d} | actor {a_loss:+.3f} | critic {c_loss:.3f} | window rew {mean_rew:+.3f} | recent ep return {recent_ret:+.3f}")
+            if e > 0:
                 torch.save(model.state_dict(), ckpt_path)
-                print(f"  [periodic] saved checkpoint at batch {b} -> {ckpt_path}")
                 if render:
                     run_demo_episode()
 
@@ -223,6 +257,17 @@ def save_training_figures(actor_losses, critic_losses, ep_returns, ep_lengths):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--render", action="store_true", help="show a live demo episode every 1000 batches")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_train = sub.add_parser("train")
+    p_train.add_argument("--render", action="store_true", help="show a live demo episode every 1000 batches")
+
+    p_demo = sub.add_parser("demo")
+    p_demo.add_argument("--checkpoint", required=True)
+    p_demo.add_argument("--episodes", type=int, default=10)
+
     args = parser.parse_args()
-    train(render=args.render)
+    if args.cmd == "train":
+        train(render=args.render)
+    elif args.cmd == "demo":
+        demo(checkpoint=args.checkpoint, episodes=args.episodes)
