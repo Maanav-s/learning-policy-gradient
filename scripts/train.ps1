@@ -1,1 +1,1 @@
-uv run python main.py train @args
+uv run python main.py train --render @args
