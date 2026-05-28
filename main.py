@@ -15,7 +15,7 @@ FIGURES_DIR = "figures"
 ENV_ID = "LunarLander-v3"
 ENV_KWARGS = dict(
     continuous=True,
-    gravity=-8.0,
+    gravity=-9.8,
     enable_wind=False,
     wind_power=15.0,
     turbulence_power=1.5,
@@ -25,8 +25,8 @@ class Policy(nn.Module):
     def __init__(self, obs_dims, act_dims):
         super().__init__()
         self.base = nn.Sequential(
-            nn.Linear(obs_dims, 64), nn.Tanh(),
-            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(obs_dims, 64), nn.LayerNorm(64), nn.Tanh(),
+            nn.Linear(64, 64), nn.LayerNorm(64), nn.Tanh(),
         )
         self.mean_head = nn.Linear(64, act_dims)
         self.log_stds = nn.Parameter(torch.zeros(act_dims))
@@ -52,31 +52,18 @@ class Critic(nn.Module):
     def __init__(self, obs_dims):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dims, 64), nn.GELU(),
-            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(obs_dims, 64), nn.LayerNorm(64), nn.GELU(),
+            nn.Linear(64, 64), nn.LayerNorm(64), nn.GELU(),
             nn.Linear(64, 1),
         )
     
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
 
-def reward_to_go(rews, dones, gamma):
-    # rews, dones: (T, num_envs). dones[t, i] = True iff env i terminated at step t.
-    # Returns discounted reward-to-go with the same shape, reset at episode boundaries.
-    rews = np.asarray(rews, dtype=np.float32)
-    dones = np.asarray(dones, dtype=np.float32)
-    out = np.empty_like(rews)
-    running = np.zeros(rews.shape[1:], dtype=np.float32)
-    for t in range(rews.shape[0] - 1, -1, -1):
-        running = rews[t] + gamma * running * (1.0 - dones[t])
-        out[t] = running
-    return out
-
-
-def train(lr=1e-3, batches=100000, batch_step=10, gamma=0.985, entropy_coef=0.001, render=False):
+def train(lr=3e-3, batches=100000, batch_step=25, gamma=0.985, entropy_coef=0.001, render=False, lam=0.95):
     envs = gym.make_vec(ENV_ID,
-                           num_envs = 15,
-                           vectorization_mode="async",
+                           num_envs = 25,
+                           vectorization_mode="sync",
                            **ENV_KWARGS)
     demo_env = gym.make(ENV_ID, render_mode="human", **ENV_KWARGS) if render else None
 
@@ -87,6 +74,18 @@ def train(lr=1e-3, batches=100000, batch_step=10, gamma=0.985, entropy_coef=0.00
     critic = Critic(obs_dim)
     actor_optimizer = Adam(model.parameters(), lr=lr)
     critic_optimizer = Adam(critic.parameters(), lr=lr)
+
+    def gae(rews, dones, values, gamma, l): #l is lambda
+        rews = np.asarray(rews, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        advantages = np.empty_like(rews)
+        running = np.zeros(rews.shape[1:], dtype=np.float32)
+        for t in range(rews.shape[0] - 1, -1, -1):
+            nonterminal = (1.0 - dones[t])
+            deltas = rews[t] - values[t] + gamma * values[t+1] * nonterminal
+            running = deltas + gamma * l * running * nonterminal
+            advantages[t] = running
+        return advantages
 
     def run_demo_episode():
         obs, _ = demo_env.reset()
@@ -130,14 +129,21 @@ def train(lr=1e-3, batches=100000, batch_step=10, gamma=0.985, entropy_coef=0.00
             ep_ret_running[done] = 0.0
             ep_len_running[done] = 0
 
-        rtg = reward_to_go(rew_buf, done_buf, gamma)               # (T, N)
-        returns = torch.as_tensor(rtg.reshape(-1), dtype=torch.float32)  # (T*N,)
-
         flat_obs = torch.as_tensor(obs_buf.reshape(T * N, obs_dim), dtype=torch.float32)
         values = critic(flat_obs)                                  # (T*N,) with grad
 
-        advantage = (returns - values).detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        # bootstrap V(s_T) on the obs returned after the last step, then build (T+1, N) for GAE
+        last_values = critic(torch.as_tensor(obs, dtype=torch.float32))       # (N,)
+        values_for_gae = np.concatenate([
+            values.detach().numpy().reshape(T, N),
+            last_values.detach().numpy()[None, :],
+        ], axis=0)                                                 # (T+1, N)
+
+        advantage_np = gae(rew_buf, done_buf, values_for_gae, gamma, lam)     # (T, N)
+        advantage_raw = torch.as_tensor(advantage_np.reshape(-1), dtype=torch.float32)
+        returns = advantage_raw + values.detach()                  # TD(λ) returns as critic target
+
+        advantage = (advantage_raw - advantage_raw.mean()) / (advantage_raw.std() + 1e-8)
 
         log_probs = torch.stack(logp_buf).reshape(-1)              # (T*N,)
         entropies = torch.stack(ent_buf).reshape(-1)               # (T*N,)
