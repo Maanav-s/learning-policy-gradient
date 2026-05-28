@@ -89,16 +89,14 @@ def demo(checkpoint, episodes=10):
 
     env.close()
 
-def train(lr=3e-3, 
-          epochs=25000, 
+def train(epochs=15000,
           minibatch=125,
-          K=4, 
-          N=25, 
-          T=25, 
+          K=4,
+          N=25,
+          T=25,
           gamma=0.985,
-          entropy_coef=0.001, 
-          render=False, 
-          lam=0.95, 
+          render=False,
+          lam=0.95,
           epsilon=0.2):
     
     envs = gym.make_vec(ENV_ID,
@@ -112,8 +110,19 @@ def train(lr=3e-3,
 
     model = Policy(obs_dim, n_actions)
     critic = Critic(obs_dim)
-    actor_optimizer = Adam(model.parameters(), lr=lr)
-    critic_optimizer = Adam(critic.parameters(), lr=lr)
+
+    def lr_schedule(epoch):
+        if epoch < 5000:
+            return 3e-3
+        return 3e-3 * 10 ** (-(epoch - 5000) / 5000)
+
+    def entropy_schedule(epoch):
+        if epoch < 5000:
+            return 0.005
+        return 0.005 * 0.5 ** ((epoch - 5000) / 2000)
+
+    actor_optimizer = Adam(model.parameters(), lr=lr_schedule(0))
+    critic_optimizer = Adam(critic.parameters(), lr=lr_schedule(0))
 
     def gae(rews, dones, values, gamma, l):
         advantages = np.empty_like(rews)
@@ -149,7 +158,7 @@ def train(lr=3e-3,
 
     obs, _ = envs.reset()
 
-    def run_epoch(obs):
+    def run_epoch(obs, entropy_coef):
         with torch.no_grad():
             for t in range(T):
                 obs_buf[t] = obs
@@ -221,10 +230,13 @@ def train(lr=3e-3,
 
     actor_losses, critic_losses = [], []
     for e in range(epochs):
-        obs, a_loss, c_loss, mean_rew = run_epoch(obs)
+        lr_now = lr_schedule(e)
+        for g in actor_optimizer.param_groups: g['lr'] = lr_now
+        for g in critic_optimizer.param_groups: g['lr'] = lr_now
+        obs, a_loss, c_loss, mean_rew = run_epoch(obs, entropy_schedule(e))
         actor_losses.append(a_loss)
         critic_losses.append(c_loss)
-        if e % 1000 == 0:
+        if e % 250 == 0:
             recent_ret = float(np.mean(ep_returns_log[-50:])) if ep_returns_log else float("nan")
             print(f"epoch {e:6d} | actor {a_loss:+.3f} | critic {c_loss:.3f} | window rew {mean_rew:+.3f} | recent ep return {recent_ret:+.3f}")
             if e > 0:
