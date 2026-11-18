@@ -11,6 +11,7 @@ import gymnasium as gym
 
 CHECKPOINT_DIR = "checkpoints"
 FIGURES_DIR = "figures"
+VIDEO_DIR = "videos"
 ENV_ID = "LunarLander-v3"
 ENV_KWARGS = dict(
     continuous=True,
@@ -88,6 +89,150 @@ def demo(checkpoint, episodes=10):
         print(f"episode {ep+1:2d} | return {ep_return:+.2f} | length {ep_length}")
 
     env.close()
+
+def record(checkpoint,
+           episodes=20,
+           keep=5,
+           seed=0,
+           deterministic=True,
+           fps=50,
+           gif=False,
+           min_return=None,
+           prefix="lunarlander"):
+    """Roll out episodes offscreen, then save the best ones as web-ready mp4 (and optional gif)."""
+    import shutil
+    import imageio.v2 as imageio
+
+    env = gym.make(ENV_ID, render_mode="rgb_array", **ENV_KWARGS)
+    obs_dim = env.observation_space.shape[0]
+    n_actions = env.action_space.shape[0]
+
+    model = Policy(obs_dim, n_actions)
+    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    model.eval()
+
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    staging = os.path.join(VIDEO_DIR, ".staging")
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.makedirs(staging)
+
+    def writer(path):
+        return imageio.get_writer(
+            path,
+            fps=fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            macro_block_size=8,
+            output_params=["-movflags", "+faststart", "-crf", "20"],
+        )
+
+    results = []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        ep_return = 0.0
+        ep_length = 0
+        path = os.path.join(staging, f"ep{ep:03d}.mp4")
+        with writer(path) as w:
+            w.append_data(env.render())
+            while not done:
+                with torch.no_grad():
+                    dist = model(torch.as_tensor(obs, dtype=torch.float32))
+                    act = torch.tanh(dist.mean) if deterministic else torch.tanh(dist.sample((5,))).mean(dim=0)
+                obs, rew, terminated, truncated, _ = env.step(act.numpy())
+                w.append_data(env.render())
+                ep_return += float(rew)
+                ep_length += 1
+                done = terminated or truncated
+        results.append(dict(ep=ep, seed=seed + ep, ret=ep_return, length=ep_length, path=path))
+        print(f"episode {ep+1:3d}/{episodes} | seed {seed+ep:4d} | return {ep_return:+.2f} | length {ep_length}")
+
+    env.close()
+
+    eligible = [r for r in results if min_return is None or r["ret"] >= min_return]
+    if not eligible:
+        print(f"\nno episode reached min_return {min_return:+.1f}; nothing saved")
+        shutil.rmtree(staging)
+        return []
+    eligible.sort(key=lambda r: -r["ret"])
+    chosen = eligible[:keep]
+
+    saved = []
+    for rank, r in enumerate(chosen, start=1):
+        base = f"{prefix}_{rank:02d}_return{r['ret']:+.0f}_seed{r['seed']}".replace("+", "p").replace("-", "m")
+        mp4_out = os.path.join(VIDEO_DIR, base + ".mp4")
+        shutil.move(r["path"], mp4_out)
+        print(f"saved {mp4_out}  (return {r['ret']:+.1f}, {r['length']} steps)")
+        saved.append(mp4_out)
+        if gif:
+            gif_out = os.path.join(VIDEO_DIR, base + ".gif")
+            frames = imageio.mimread(mp4_out, memtest=False)
+            step = max(1, round(fps / 25))
+            imageio.mimsave(gif_out, frames[::step], fps=fps / step, loop=0)
+            print(f"saved {gif_out}")
+            saved.append(gif_out)
+
+    shutil.rmtree(staging, ignore_errors=True)
+    rets = np.array([r["ret"] for r in results])
+    print(f"\n{len(chosen)} of {episodes} episodes kept | all-episode mean return {rets.mean():+.1f}")
+    return saved
+
+
+def evaluate_policy(checkpoint, episodes=100, seed=0, deterministic=True, threshold=150.0):
+    env = gym.make(ENV_ID, **ENV_KWARGS)
+    obs_dim = env.observation_space.shape[0]
+    n_actions = env.action_space.shape[0]
+
+    model = Policy(obs_dim, n_actions)
+    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    model.eval()
+
+    returns = np.zeros(episodes, dtype=np.float64)
+    lengths = np.zeros(episodes, dtype=np.int64)
+
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        ep_return = 0.0
+        ep_length = 0
+        while not done:
+            with torch.no_grad():
+                dist = model(torch.as_tensor(obs, dtype=torch.float32))
+                act = torch.tanh(dist.mean) if deterministic else torch.tanh(dist.sample((5,))).mean(dim=0)
+            obs, rew, terminated, truncated, _ = env.step(act.numpy())
+            ep_return += float(rew)
+            ep_length += 1
+            done = terminated or truncated
+        returns[ep] = ep_return
+        lengths[ep] = ep_length
+        if (ep + 1) % 10 == 0:
+            print(f"  {ep+1:3d}/{episodes} episodes | running mean {returns[:ep+1].mean():+.1f}")
+
+    env.close()
+
+    def wilson(successes, n, z=1.96):
+        if n == 0:
+            return (float("nan"), float("nan"))
+        p = successes / n
+        denom = 1 + z * z / n
+        center = (p + z * z / (2 * n)) / denom
+        half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+        return (max(0.0, center - half), min(1.0, center + half))
+
+    n = len(returns)
+    print(f"\n=== {n} evaluation episodes ({'deterministic' if deterministic else 'stochastic'} policy, seeds {seed}..{seed+n-1}) ===")
+    print(f"mean return    {returns.mean():+.1f} +/- {returns.std(ddof=1)/np.sqrt(n):.1f} (SEM), std {returns.std(ddof=1):.1f}")
+    print(f"median return  {np.median(returns):+.1f}   min {returns.min():+.1f}   max {returns.max():+.1f}")
+    print(f"percentiles    p5 {np.percentile(returns,5):+.1f} | p25 {np.percentile(returns,25):+.1f} | p75 {np.percentile(returns,75):+.1f} | p95 {np.percentile(returns,95):+.1f}")
+    print(f"mean length    {lengths.mean():.0f} steps")
+    for thr in sorted({threshold, 200.0, 0.0}):
+        hits = int((returns >= thr).sum())
+        lo, hi = wilson(hits, n)
+        print(f"return >= {thr:6.0f}  {hits:3d}/{n} = {100*hits/n:5.1f}%   (95% CI {100*lo:.1f}-{100*hi:.1f}%)")
+
+    return returns, lengths
+
 
 def train(epochs=15000,
           minibatch=125,
@@ -298,8 +443,42 @@ if __name__ == "__main__":
     p_demo.add_argument("--checkpoint", required=True)
     p_demo.add_argument("--episodes", type=int, default=10)
 
+    p_eval = sub.add_parser("eval", help="headless evaluation over many episodes")
+    p_eval.add_argument("--checkpoint", default=os.path.join(CHECKPOINT_DIR, "policy.pt"))
+    p_eval.add_argument("--episodes", type=int, default=100)
+    p_eval.add_argument("--seed", type=int, default=0)
+    p_eval.add_argument("--threshold", type=float, default=150.0)
+    p_eval.add_argument("--stochastic", action="store_true", help="sample actions instead of using the distribution mean")
+
+    p_rec = sub.add_parser("record", help="save mp4/gif demo videos of the best evaluation episodes")
+    p_rec.add_argument("--checkpoint", default=os.path.join(CHECKPOINT_DIR, "policy.pt"))
+    p_rec.add_argument("--episodes", type=int, default=20, help="episodes to roll out as candidates")
+    p_rec.add_argument("--keep", type=int, default=5, help="how many of the best episodes to save")
+    p_rec.add_argument("--seed", type=int, default=0)
+    p_rec.add_argument("--fps", type=int, default=50)
+    p_rec.add_argument("--gif", action="store_true", help="also write a gif next to each mp4")
+    p_rec.add_argument("--min-return", type=float, default=None, help="only save episodes at or above this return")
+    p_rec.add_argument("--prefix", default="lunarlander")
+    p_rec.add_argument("--stochastic", action="store_true", help="sample actions instead of using the distribution mean")
+
     args = parser.parse_args()
     if args.cmd == "train":
         train(render=args.render)
     elif args.cmd == "demo":
         demo(checkpoint=args.checkpoint, episodes=args.episodes)
+    elif args.cmd == "record":
+        record(checkpoint=args.checkpoint,
+               episodes=args.episodes,
+               keep=args.keep,
+               seed=args.seed,
+               deterministic=not args.stochastic,
+               fps=args.fps,
+               gif=args.gif,
+               min_return=args.min_return,
+               prefix=args.prefix)
+    elif args.cmd == "eval":
+        evaluate_policy(checkpoint=args.checkpoint,
+                        episodes=args.episodes,
+                        seed=args.seed,
+                        deterministic=not args.stochastic,
+                        threshold=args.threshold)

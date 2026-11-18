@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Recorded rollouts (keep only the committed demo clip)
+videos/*
+!videos/lunarlander_demo_2ep.mp4
